@@ -138,8 +138,12 @@ resource "kubernetes_ingress_v1" "app" {
 # first. The destroy provisioner explicitly deletes the Ingress via kubectl
 # (stripping any finalizers), then polls AWS until the ALB is fully gone before
 # Terraform proceeds to destroy anything else.
+# ── ALB deletion wait ─────────────────────────────────────────────────────────
+# All values needed at destroy-time are stored in triggers so the provisioner
+# only references self.triggers.* — Terraform's destroy provisioner rule.
+# $$ escapes a literal $ in the heredoc so Terraform does not try to
+# interpolate shell variables like $NS as Terraform expressions.
 resource "null_resource" "alb_cleanup" {
-  # Re-run whenever the ingress identity changes.
   triggers = {
     namespace    = kubernetes_namespace.app.metadata[0].name
     ingress_name = kubernetes_ingress_v1.app.metadata[0].name
@@ -158,45 +162,40 @@ resource "null_resource" "alb_cleanup" {
       CLUSTER="${self.triggers.cluster_name}"
       REGION="${self.triggers.aws_region}"
 
-      echo "==> Updating kubeconfig for cluster $CLUSTER"
-      aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER"
+      echo "==> Updating kubeconfig for cluster $$CLUSTER"
+      aws eks update-kubeconfig --region "$$REGION" --name "$$CLUSTER"
 
-      echo "==> Removing finalizers from Ingress $ING (if any)"
-      kubectl patch ingress "$ING" -n "$NS" \
+      echo "==> Removing finalizers from Ingress $$ING"
+      kubectl patch ingress "$$ING" -n "$$NS" \
         --type=json \
         -p='[{"op":"replace","path":"/metadata/finalizers","value":[]}]' \
         2>/dev/null || true
 
-      echo "==> Deleting Ingress $ING to trigger ALB cleanup"
-      kubectl delete ingress "$ING" -n "$NS" --ignore-not-found --timeout=30s || true
+      echo "==> Deleting Ingress $$ING to trigger ALB deletion"
+      kubectl delete ingress "$$ING" -n "$$NS" --ignore-not-found --timeout=30s || true
 
-      echo "==> Waiting for AWS to delete the ALB (polls every 15 s, timeout 5 min)"
-      for i in $(seq 1 20); do
-        LB_COUNT=$(aws elbv2 describe-load-balancers \
-          --query "LoadBalancers[?contains(LoadBalancerName, '${NS}') || contains(LoadBalancerName, '${ING}')].LoadBalancerArn" \
-          --output text | wc -w)
-        if [ "$LB_COUNT" -eq 0 ]; then
-          echo "==> ALB deleted successfully."
+      echo "==> Polling AWS until the ALB is gone (every 15 s, up to 5 min)"
+      for i in $$(seq 1 20); do
+        LB_COUNT=$$(aws elbv2 describe-load-balancers \
+          --query "length(LoadBalancers[?Tags[?Key=='ingress.k8s.aws/stack' && Value=='$$NS/$$ING']])" \
+          --output text 2>/dev/null || echo "0")
+        if [ "$$LB_COUNT" -eq 0 ]; then
+          echo "==> ALB deleted."
           exit 0
         fi
-        echo "    ($i/20) ALB still deleting… waiting 15 s"
+        echo "    ($$i/20) ALB still deleting — waiting 15 s"
         sleep 15
       done
-
-      echo "WARNING: ALB may not be fully deleted. Proceeding anyway."
+      echo "==> ALB not fully deleted within timeout — continuing."
     BASH
   }
 
   depends_on = [kubernetes_ingress_v1.app]
 }
 
-# ── Destroy-time namespace finalizer patch ────────────────────────────────────
-# Problem: Kubernetes namespaces can get stuck in "Terminating" forever if any
-# resource inside still has a finalizer that no controller is handling.
-#
-# Fix: this null_resource is destroyed last in the module (nothing depends on
-# it). Its destroy provisioner force-patches the namespace to clear all
-# finalizers so Kubernetes can complete the deletion immediately.
+# ── Namespace finalizer patch ─────────────────────────────────────────────────
+# Runs after alb_cleanup. If the namespace is stuck in Terminating it clears
+# its finalizers so Kubernetes can complete the deletion.
 resource "null_resource" "namespace_cleanup" {
   triggers = {
     namespace    = kubernetes_namespace.app.metadata[0].name
@@ -214,30 +213,26 @@ resource "null_resource" "namespace_cleanup" {
       CLUSTER="${self.triggers.cluster_name}"
       REGION="${self.triggers.aws_region}"
 
-      echo "==> Updating kubeconfig for cluster $CLUSTER"
-      aws eks update-kubeconfig --region "$REGION" --name "$CLUSTER"
+      echo "==> Updating kubeconfig for cluster $$CLUSTER"
+      aws eks update-kubeconfig --region "$$REGION" --name "$$CLUSTER"
 
-      echo "==> Checking namespace $NS status"
-      PHASE=$(kubectl get namespace "$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
+      PHASE=$$(kubectl get namespace "$$NS" -o jsonpath='{.status.phase}' 2>/dev/null || echo "NotFound")
 
-      if [ "$PHASE" = "Terminating" ]; then
-        echo "==> Namespace is Terminating — clearing finalizers"
-        kubectl get namespace "$NS" -o json | \
-          python3 -c "
+      if [ "$$PHASE" = "Terminating" ]; then
+        echo "==> Namespace stuck in Terminating — clearing finalizers"
+        kubectl get namespace "$$NS" -o json \
+          | python3 -c "
 import sys, json
 ns = json.load(sys.stdin)
 ns['spec']['finalizers'] = []
 print(json.dumps(ns))
-" | kubectl replace --raw "/api/v1/namespaces/$NS/finalize" -f - 2>/dev/null || true
+" | kubectl replace --raw "/api/v1/namespaces/$$NS/finalize" -f - 2>/dev/null || true
         echo "==> Finalizers cleared."
       else
-        echo "==> Namespace phase is '$PHASE' — no finalizer patch needed."
+        echo "==> Namespace phase is '$$PHASE' — nothing to do."
       fi
     BASH
   }
 
-  # No depends_on — Terraform will naturally destroy this last because
-  # alb_cleanup (which depends on the ingress) has no dependency on it,
-  # and the namespace is the root of the create-time dependency chain.
   depends_on = [null_resource.alb_cleanup]
 }

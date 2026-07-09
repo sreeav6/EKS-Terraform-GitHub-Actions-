@@ -7,7 +7,7 @@ variable "aws_region" {
 variable "state_bucket_name" {
   description = "Globally unique S3 bucket name for Terraform state. Must be unique across all AWS accounts."
   type        = string
-  default     = "simpletimeservice-tf-state"
+  default     = "simpletimeservice-tf-state-4991"
 }
 
 variable "lock_table_name" {
