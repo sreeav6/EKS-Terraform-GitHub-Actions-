@@ -5,7 +5,7 @@ terraform {
   # Run terraform/bootstrap/ once first to create the bucket and table,
   # then fill in the values below with the bootstrap outputs.
   backend "s3" {
-    bucket         = "simpletimeservice-tf-state"
+    bucket         = "simpletimeservice-tf-state-4991"
     key            = "simpletimeservice/terraform.tfstate"
     region         = "us-east-1"
     dynamodb_table = "simpletimeservice-tf-lock"
